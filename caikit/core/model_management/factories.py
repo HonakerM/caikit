@@ -32,6 +32,12 @@ model_trainer_factory.register(LocalModelTrainer)
 model_finder_factory = ImportableFactory("ModelFinder")
 model_finder_factory.register(LocalModelFinder)
 model_finder_factory.register(MultiModelFinder)
+# Attempt to import the S3 model finder
+try:
+    from .s3_model_finder import S3ModelFinder
+    model_finder_factory.register(S3ModelFinder)
+except ImportError:
+    pass
 
 # Model initializer factory. An initializer is responsible for taking a model
 # configuration and preparing the model to be run in a configured runtime
