@@ -46,13 +46,17 @@ runtime-http = [
     "sse-starlette>=1.6.1,<2",
 ]
 
+core-s3 = [
+    "boto3>=1.28.78,<2"
+]
+
 interfaces-vision = [
     "pillow>=6.2.1,<11.0"
 ]
 
 # NOTE: This is "all" from the user perspective, not the dev perspective
 all = [
-    "caikit[runtime-grpc, runtime-http, interfaces-vision]",
+    "caikit[runtime-grpc, runtime-http, core-s3, interfaces-vision]",
 ]
 
 ## Dev Extra Sets ##
