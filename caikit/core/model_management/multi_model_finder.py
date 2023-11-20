@@ -23,7 +23,7 @@ model_management:
             type: MULTI
             config:
                 # Sequence of other finder names to use in priority order
-                finder_sequence:
+                finder_priority:
                     - other_finder1
                     - other_finder2
 """
