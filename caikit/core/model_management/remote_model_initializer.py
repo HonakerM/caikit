@@ -25,6 +25,8 @@ model_management:
 # Standard
 from typing import Tuple, List, Optional, Dict, Any
 import copy
+from inspect import signature
+import uuid
 from functools import partial
 import inspect
 from functools import cached_property
@@ -42,6 +44,7 @@ from ..exceptions import error_handler
 from ..task import TaskBase, task
 from ..module_backends import BackendBase, backend_types
 from ..modules import ModuleBase, ModuleConfig, module
+from ..modules.meta import _ModuleBaseMeta
 from ..data_model import DataObjectBase, DataBase
 from ..modules.decorator import SUPPORTED_LOAD_BACKENDS_VAR_NAME
 from ..registries import (
@@ -49,8 +52,7 @@ from ..registries import (
     module_backend_registry,
     module_backend_types,
 )
-from ...runtime.service_generation.rpcs import CaikitRPCBase
-from ...runtime.service_factory import ServicePackage, ServicePackageFactory
+from ..signature_parsing import CaikitMethodSignature
 
 from .remote_model_finder import RemoteModuleConfig
 from .model_initializer_base import ModelInitializerBase
@@ -83,80 +85,133 @@ class RemoteModelInitializer(ModelInitializerBase):
         remote_module_class = self._module_class_map[module_class.MODULE_ID]
         return remote_module_class(model_config.connection, model_config.protocol)
 
-    def _init_module_class(self, module_class: type[ModuleBase])->ModuleBase:
-        """"""
-        @module(
-            id=f"{module_class.MODULE_ID}_remote",
-            name=f"{module_class.MODULE_NAME} Remote",
-            version=module_class.MODULE_VERSION,
-            # We should make a remote backend that just stores signatures
-            backend_type="LOCAL"
-        )
-        class _RemoteModelInstance(_RemoteModelBaseClass):
-            pass
+    def _init_module_class(self, module_class: type[ModuleBase])->type[ModuleBase]:
+        """Helper class to create Module"""
 
-        if hasattr(module_class.TRAIN_SIGNATURE,"_method_pointer"):
-            setattr(_RemoteModelInstance, module_class.TRAIN_SIGNATURE.method_name, _RemoteModelInstance._train)
-
+        # Gather inference and train signatures from module class
+        inference_signatures = {}
         for task in module_class.tasks:
-            # This should add a run arg? I'm not positive though
-            for input, output, signature in module_class.get_inference_signatures(task):
-                infer_func = partial(
-                    _RemoteModelInstance._infer,
-                    input_streaming=input,
-                    output_streaming=output
-                )
-                setattr(_RemoteModelInstance,signature.method_name,infer_func)
+            inference_signatures[task] = module_class.get_inference_signatures(task)
 
-        return _RemoteModelInstance
+        from ...runtime.service_generation.rpcs import ModuleClassTrainRPC
+        train_rpc_name = ModuleClassTrainRPC.module_class_to_rpc_name(module_class)
+        train_signature = (train_rpc_name, module_class.TRAIN_SIGNATURE)
 
+        return construct_remote_module_class(
+            inference_signatures,
+            train_signature,
+            module_class.MODULE_ID,
+            module_class.MODULE_NAME
+        )
+
+
+
+def construct_remote_module_class(inference_signatures: Dict[type[TaskBase], List[Tuple[bool, bool, CaikitMethodSignature]]], train_signature: Optional[Tuple[str, CaikitMethodSignature]], source_module_id: str=None, source_module_name: str=None)->type[ModuleBase]:
+    # Don't default to uuid.uuid4 in args to ensure value is recomputed.
+    remote_module_id = f"{source_module_id}_remote" if source_module_id else uuid.uuid4()
+    remote_module_name = f"{source_module_name} Remote" if source_module_name else "Remote Module"
+
+    class _RemoteModelInstance(_RemoteModelBaseClass):
+        pass
+
+    # Add the method signatures for train and each task
+    if train_signature:
+        rpc_name, signature = train_signature
+        partial(
+            _RemoteModelInstance.remote_train,
+            rpc_name=rpc_name
+        )
+        setattr(_RemoteModelInstance, signature.method_name, _RemoteModelInstance.remote_train)
+
+    for task in inference_signatures:
+        for input, output, signature in inference_signatures[task]:
+            infer_func = _RemoteModelInstance.generate_inference_function(task, input, output, signature)
+            setattr(_RemoteModelInstance, signature.method_name, infer_func)
+
+    _RemoteModelInstance = module(
+        id=remote_module_id,
+        name=remote_module_name,
+        version="0.0.0",
+        tasks=list(inference_signatures.keys()),
+        # We should make a remote backend that just stores signatures
+        backend_type="LOCAL"
+    )(_RemoteModelInstance)
+
+    return _RemoteModelInstance
 
 class _RemoteModelBaseClass(ModuleBase):
+
     def __init__(self, connection_info: Dict[str,Any], protocol: str):
         self.connection_info = connection_info
         self.protocol = protocol
 
+    @classmethod
+    def generate_inference_function(cls, task: type[TaskBase], input, output, method_signature: CaikitMethodSignature ):
+        """Helper function to generate inference functions that will be set as attributes"""
+        def infer_func(self, *args,**kwargs)->method_signature.return_type:
+            return self.remote_infer(
+                *args,
+                task_class=task,
+                input_streaming=input,
+                output_streaming=output,
+                **kwargs,
+            )
+
+        # Override infer function name attributes
+        infer_func.__name__ = method_signature.method_name
+        infer_func.__qualname__ = method_signature._method_pointer.__qualname__
+        infer_func.__signature__ = signature(method_signature._method_pointer)
+
+        task_wrapped_infer_func = task.taskmethod(input, output)(infer_func)
+        return task_wrapped_infer_func
+
     # Cache the service-package to avoid computation. Don't do this in init as
     # it has to be called after the runtime server has started
     @cached_property
-    def service_package(self) -> ServicePackage:
+    def inference_service_package(self):
+        from ...runtime.service_factory import ServicePackageFactory
+
         return ServicePackageFactory.get_service_package(
             ServicePackageFactory.ServiceType.INFERENCE
         )
 
-    def _train(self, *args, **kwargs):
-        pass
+    @cached_property
+    def training_service_package(self):
+        from ...runtime.service_factory import ServicePackageFactory
 
-    def _infer(self, task_class: type[TaskBase], *args, input_streaming=False, output_streaming=False, **kwargs):
+        return ServicePackageFactory.get_service_package(
+            ServicePackageFactory.ServiceType.TRAINING
+        )
+
+    def remote_train(self, rpc_name: str, *args, **kwargs):
+        from ...runtime.service_generation.rpcs import ModuleClassTrainRPC
         if self.protocol == "grpc":
-            return self._infer_via_grpc(task_class, *args, output_streaming=output_streaming, **kwargs)
+            train_rpc = self.training_service_package.caikit_rpcs.get(rpc_name)
+            self._request_via_grpc(self.training_service_package, train_rpc, *args, **kwargs)
+
         raise NotImplementedError(f"Unknown protocol {self.protocol}")
-    def _infer_via_grpc(self, task_class: type[TaskBase],*args,output_streaming=False, **kwargs) -> DataObjectBase:
-        with self._grpc_channel() as channel:
-            # Get the prediction name and service rpc
-            task_prediction_name = f"{task_class.__name__}Predict"
-            runtime_rpc = self.service_package.caikit_rpcs.get(task_prediction_name)
 
-            # Construct request datamodel
-            request_data_model_class = DataBase.get_class_for_name(runtime_rpc.name)
-            request_dm = request_data_model_class(*args, **kwargs)
+    def remote_infer(self, task_class: type[TaskBase], *args, input_streaming=False, output_streaming=False, **kwargs):
+        if self.protocol == "grpc":
+            infer_rpc = self.inference_service_package.caikit_rpcs.get(f"{task_class.__name__}Predict")
+            return self._request_via_grpc(self.inference_service_package, infer_rpc, *args, **kwargs)
 
-            # Send RPC request and close channel once completed
-            stub = self.service_package.stub_class(channel)
-            rpc = getattr(stub, task_prediction_name)
-            response_protobuf = rpc(request_dm.to_proto(), metadata=self._meta_data)
+        raise NotImplementedError(f"Unknown protocol {self.protocol}")
 
-            # Parse the GRPC protobuf into a DM
-            response_dm_class = task_class.get_output_type(output_streaming=output_streaming)
-            response = response_dm_class.from_proto(response_protobuf)
-            return response
-
-    @contextmanager
-    def _grpc_channel(self)->Channel:
+    def _request_via_grpc(self, service_package: "ServicePackage", request_rpc: "CaikitRPCBase", *args, **kwargs):
         channel_target = self._get_channel_target()
         grpc_options = self._get_grpc_options()
         with Channel(channel_target, grpc_options, None, None) as channel:
-            yield channel
+            # Construct the request object
+            request_data_model_class = DataBase.get_class_for_name(request_rpc.request.name)
+            request_dm = request_data_model_class(*args, **kwargs)
+
+            # Send RPC request and close channel once completed
+            stub = service_package.stub_class(channel)
+            rpc = getattr(stub, request_rpc.name)
+            response_protobuf = rpc(request_dm.to_proto(), metadata={"mm-model-id":"<REPLACE WITH MODEL_ID>"})
+
+            return request_rpc.return_type.from_proto(response_protobuf)
 
     def _get_grpc_options(self) -> List[Tuple]:
         return list(self.connection_info.get("options", {}).items())

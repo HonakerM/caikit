@@ -27,6 +27,7 @@ model_management:
                     tls:
                         ca: Optional[str] <path to remote ca file>
                         cert: Optional[str] <path to MTLS cert>
+                    options: Optional[Dict[str,str]] <optional dict of grpc or rest options>
                 protocol: Optional[str]="grpc" <protocol the remote server is using>
                 default_module: Optional[str] <the default module_class to use if one is not provided>
                 supported_models:
@@ -42,7 +43,8 @@ import alog
 
 # Local
 from ..exceptions import error_handler
-from ..modules import ModuleConfig
+from ..modules import ModuleConfig, ModuleBase
+from ..registries import module_registry
 from .model_finder_base import ModelFinderBase
 
 log = alog.use_channel("RFIND")
@@ -61,7 +63,8 @@ class RemoteModelFinder(ModelFinderBase):
         """Initialize with an optional path prefix"""
         self._connection_info = config.connection
         self._protocol = config.get("protocol","grpc")
-        self._supported_models = config.get("supported_models")
+        self._all_models = config.get("supported_models") is None
+        self._supported_models = config.get("supported_models", {})
         self._default_module = config.get("default_module")
         self._instance_name = instance_name
 
@@ -72,8 +75,11 @@ class RemoteModelFinder(ModelFinderBase):
         error.type_check("<COR73381567E>",int, host=self._connection_info.port)
 
         tls_info = self._connection_info.get("tls",{})
-        error.type_check("<COR74321567E>",int, allow_none=True, tls_ca=tls_info.get("ca"),tls_cert=tls_info.get("cert"))
+        error.type_check("<COR74321567E>",str, allow_none=True, tls_ca=tls_info.get("ca"),tls_cert=tls_info.get("cert"))
 
+        # Replace the string references in supported_models with the real representation
+        for model_name in self._supported_models:
+            self._supported_models[model_name] = module_registry().get(self._supported_models[model_name])
 
     def find_model(
         self,
@@ -83,7 +89,7 @@ class RemoteModelFinder(ModelFinderBase):
         """Check if the remote runtime supports the model_path"""
 
         # If supported_models was supplied and model_path is not present then raise an error
-        if self._supported_models is not None and model_path not in self._supported_models:
+        if not self._all_models and model_path not in self._supported_models:
             raise KeyError(f"Model {model_path} is not supported by finder {self._instance_name}")
 
         module_class = self._supported_models.get(model_path, self._default_module)
