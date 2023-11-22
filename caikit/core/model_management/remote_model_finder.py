@@ -30,8 +30,9 @@ model_management:
                     options: Optional[Dict[str,str]] <optional dict of grpc or rest options>
                 protocol: Optional[str]="grpc" <protocol the remote server is using>
                 default_module: Optional[str] <the default module_class to use if one is not provided>
-                supported_models:
-                    - Optional[list[str]] <list of models this remote has available>
+                supported_models: Optional[Dict[str, str]] <mapping of models to modules_class>
+                    <model_name>:<module_id>
+
 """
 # Standard
 from typing import Optional
@@ -43,15 +44,18 @@ import alog
 
 # Local
 from ..exceptions import error_handler
-from ..modules import ModuleConfig, ModuleBase
+from ..modules import ModuleBase, ModuleConfig
 from ..registries import module_registry
 from .model_finder_base import ModelFinderBase
 
 log = alog.use_channel("RFIND")
 error = error_handler.get(log)
 
+
 class RemoteModuleConfig(ModuleConfig):
     """Helper class to differentiate a local ModuleConfig and a RemoteModuleConfig"""
+
+    reserved_keys = []
 
 
 class RemoteModelFinder(ModelFinderBase):
@@ -62,24 +66,37 @@ class RemoteModelFinder(ModelFinderBase):
     def __init__(self, config: aconfig.Config, instance_name: str):
         """Initialize with an optional path prefix"""
         self._connection_info = config.connection
-        self._protocol = config.get("protocol","grpc")
+        self._protocol = config.get("protocol", "grpc")
         self._all_models = config.get("supported_models") is None
         self._supported_models = config.get("supported_models", {})
         self._default_module = config.get("default_module")
         self._instance_name = instance_name
 
         # Type check parameters
-        error.type_check("<COR72281545E>",str, protocol=self._protocol)
-        error.type_check("<COR74343245E>",dict, allow_none=True, supported_models=self._supported_models)
-        error.type_check("<COR72281587E>",str, host=self._connection_info.host)
-        error.type_check("<COR73381567E>",int, host=self._connection_info.port)
+        error.type_check("<COR72281545E>", str, protocol=self._protocol)
+        error.type_check(
+            "<COR74343245E>",
+            dict,
+            allow_none=True,
+            supported_models=self._supported_models,
+        )
+        error.type_check("<COR72281587E>", str, host=self._connection_info.host)
+        error.type_check("<COR73381567E>", int, host=self._connection_info.port)
 
-        tls_info = self._connection_info.get("tls",{})
-        error.type_check("<COR74321567E>",str, allow_none=True, tls_ca=tls_info.get("ca"),tls_cert=tls_info.get("cert"))
+        tls_info = self._connection_info.get("tls", {})
+        error.type_check(
+            "<COR74321567E>",
+            str,
+            allow_none=True,
+            tls_ca=tls_info.get("ca"),
+            tls_cert=tls_info.get("cert"),
+        )
 
         # Replace the string references in supported_models with the real representation
         for model_name in self._supported_models:
-            self._supported_models[model_name] = module_registry().get(self._supported_models[model_name])
+            self._supported_models[model_name] = module_registry().get(
+                self._supported_models[model_name]
+            )
 
     def find_model(
         self,
@@ -90,13 +107,18 @@ class RemoteModelFinder(ModelFinderBase):
 
         # If supported_models was supplied and model_path is not present then raise an error
         if not self._all_models and model_path not in self._supported_models:
-            raise KeyError(f"Model {model_path} is not supported by finder {self._instance_name}")
+            raise KeyError(
+                f"Model {model_path} is not supported by finder {self._instance_name}"
+            )
 
         module_class = self._supported_models.get(model_path, self._default_module)
-        return RemoteModuleConfig(
+        module_config = RemoteModuleConfig(
             {
-                "connection":self._connection_info,
-                "protocol":self._protocol,
-                "module_class":module_class,
+                "connection": self._connection_info,
+                "protocol": self._protocol,
+                "module_class": module_class,
+                "model_path": model_path,
             }
         )
+
+        return module_config
