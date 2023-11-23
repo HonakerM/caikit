@@ -37,16 +37,14 @@ model_management:
 # Standard
 from dataclasses import dataclass
 from typing import Optional
-import os
 
 # First Party
 import aconfig
 import alog
 
 # Local
-from ..data_model import DataBase, DataObjectBase
 from ..exceptions import error_handler
-from ..modules import ModuleBase, ModuleConfig
+from ..modules import ModuleConfig
 from ..registries import module_registry
 from ..signature_parsing import CaikitMethodSignature
 from .model_finder_base import ModelFinderBase
@@ -81,13 +79,14 @@ class RemoteModuleConfig(ModuleConfig):
 
 @dataclass
 class RemoteMethodRpc:
-    """Helper dataclass to store information about a RPC. This includes the service function"""
+    """Helper dataclass to store information about an RPC. This includes the method signature, request&response
+    data objects and the RPC name"""
 
     # full signature for this RPC
     signature: CaikitMethodSignature
     # Request and response objects for this RPC
-    request_dm: DataBase
-    response_dm: DataBase
+    request_dm_name: str
+    response_dm_name: str
     # The function name on the GRPC Servicer
     rpc_name: str
 
@@ -164,12 +163,6 @@ class RemoteModelFinder(ModelFinderBase):
             "module_name": module_class.MODULE_NAME,
         }
 
-        # These are a really bad imports!! This is required because I wanted to reuse the string formatting from
-        # service_generation
-        # Local
-        from ...runtime.service_factory import get_inference_request, get_train_request
-        from ...runtime.service_generation.rpcs import ModuleClassTrainRPC
-
         # Parse inference methods signatures
         for task_class in module_class.tasks:
             task_methods = []
@@ -179,12 +172,23 @@ class RemoteModelFinder(ModelFinderBase):
 
                 rpc_name = f"{task_class.__name__}Predict"
 
-                request_dm = get_inference_request(task_class, input, output)
+                # This code is completely stolen from caikit.runtime.service_factory.get_inference_request
+                # Don't get the actual DataBaseObject as the ServicePackage might not have
+                # been generated
+                if input and output:
+                    request_class_name = f"BidiStreaming{task_class.__name__}Request"
+                elif input:
+                    request_class_name = f"ClientStreaming{task_class.__name__}Request"
+                elif output:
+                    request_class_name = f"ServerStreaming{task_class.__name__}Request"
+                else:
+                    request_class_name = f"{task_class.__name__}Request"
+
                 task_methods.append(
                     RemoteMethodRpc(
                         signature=signature,
-                        request_dm=request_dm,
-                        response_dm=signature.return_type,
+                        request_dm_name=request_class_name,
+                        response_dm_name=signature.return_type.__name__,
                         rpc_name=rpc_name,
                         input_streaming=input,
                         output_streaming=output,
@@ -198,14 +202,15 @@ class RemoteModelFinder(ModelFinderBase):
             module_class.TRAIN_SIGNATURE.return_type is not None
             and module_class.TRAIN_SIGNATURE.parameters is not None
         ):
-
-            rpc_name = ModuleClassTrainRPC.module_class_to_rpc_name(module_class)
-            request_dm = get_train_request(module_class)
+            # This code is completely stolen from caikit.runtime.service_generation.rpc.ModuleClassTrainRPC
+            first_task = next(iter(module_class.tasks))
+            rpc_name = f"{first_task.__name__}{module_class.__name__}Train"
+            request_dm_name = f"{rpc_name}Request"
 
             remote_config_dict["train_method"] = RemoteMethodRpc(
                 signature=module_class.TRAIN_SIGNATURE,
-                request_dm=request_dm,
-                response_dm=module_class.TRAIN_SIGNATURE.return_type,
+                request_dm_name=request_dm_name,
+                response_dm_name=module_class.TRAIN_SIGNATURE.return_type.__name__,
                 rpc_name=rpc_name,
             )
 

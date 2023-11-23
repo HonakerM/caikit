@@ -242,7 +242,9 @@ class _RemoteModelBaseClass(ModuleBase):
         grpc_options = self._get_grpc_options()
         with Channel(channel_target, grpc_options, None, None) as channel:
             # Construct the request object
-            request_dm = method.request_dm(*args, **kwargs)
+            request_dm = DataBase.get_class_for_name(method.request_dm_name)(
+                *args, **kwargs
+            )
 
             # Send RPC request and close channel once completed
             stub = service_package.stub_class(channel)
@@ -251,7 +253,9 @@ class _RemoteModelBaseClass(ModuleBase):
                 request_dm.to_proto(), metadata=[("mm-model-id", self.model_name)]
             )
 
-            return method.response_dm.from_proto(response_protobuf)
+            return DataBase.get_class_for_name(method.response_dm_name).from_proto(
+                response_protobuf
+            )
 
     def _get_grpc_options(self) -> List[Tuple]:
         return list(self.connection_info.get("options", {}).items())
