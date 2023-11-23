@@ -35,6 +35,7 @@ model_management:
 
 """
 # Standard
+from dataclasses import dataclass
 from typing import Optional
 import os
 
@@ -43,9 +44,11 @@ import aconfig
 import alog
 
 # Local
+from ..data_model import DataBase, DataObjectBase
 from ..exceptions import error_handler
 from ..modules import ModuleBase, ModuleConfig
 from ..registries import module_registry
+from ..signature_parsing import CaikitMethodSignature
 from .model_finder_base import ModelFinderBase
 
 log = alog.use_channel("RFIND")
@@ -53,9 +56,44 @@ error = error_handler.get(log)
 
 
 class RemoteModuleConfig(ModuleConfig):
-    """Helper class to differentiate a local ModuleConfig and a RemoteModuleConfig"""
+    """Helper class to differentiate a local ModuleConfig and a RemoteModuleConfig. The structure
+    should be as follows:
+    {
+        # Remote information copied from Finder config
+        connection: Dict[str, Any]
+        protocol: str
 
+        # Method information
+        # use list and tuples instead of a dictionary to avoid aconfig.Config error
+        inference_methods: List[Tuple[type[TaskBase], List[RemoteMethodRpc]]]
+        train_method: RemoteMethodRpc,
+
+        # Source Module Information
+        module_id: str
+        module_name: str
+        model_path: str
+    }
+    """
+
+    # Reset reserved_keys, so we can manually add module_path
     reserved_keys = []
+
+
+@dataclass
+class RemoteMethodRpc:
+    """Helper dataclass to store information about a RPC. This includes the service function"""
+
+    # full signature for this RPC
+    signature: CaikitMethodSignature
+    # Request and response objects for this RPC
+    request_dm: DataBase
+    response_dm: DataBase
+    # The function name on the GRPC Servicer
+    rpc_name: str
+
+    # Only used for infer RPC types
+    input_streaming: bool
+    output_streaming: bool
 
 
 class RemoteModelFinder(ModelFinderBase):
@@ -112,13 +150,63 @@ class RemoteModelFinder(ModelFinderBase):
             )
 
         module_class = self._supported_models.get(model_path, self._default_module)
-        module_config = RemoteModuleConfig(
-            {
-                "connection": self._connection_info,
-                "protocol": self._protocol,
-                "module_class": module_class,
-                "model_path": model_path,
-            }
-        )
 
-        return module_config
+        remote_config_dict = {
+            # Connection info
+            "connection": self._connection_info,
+            "protocol": self._protocol,
+            # Method info
+            "inference_methods": [],
+            "train_method": None,
+            # Source module info
+            "model_path": model_path,
+            "module_id": module_class.MODULE_ID,
+            "module_name": module_class.MODULE_NAME,
+        }
+
+        # These are a really bad imports!! This is required because I wanted to reuse the string formatting from
+        # service_generation
+        # Local
+        from ...runtime.service_factory import get_inference_request, get_train_request
+        from ...runtime.service_generation.rpcs import ModuleClassTrainRPC
+
+        # Parse inference methods signatures
+        for task_class in module_class.tasks:
+            task_methods = []
+            for input, output, signature in module_class.get_inference_signatures(
+                task_class
+            ):
+
+                rpc_name = f"{task_class.__name__}Predict"
+
+                request_dm = get_inference_request(task_class, input, output)
+                task_methods.append(
+                    RemoteMethodRpc(
+                        signature=signature,
+                        request_dm=request_dm,
+                        response_dm=signature.return_type,
+                        rpc_name=rpc_name,
+                        input_streaming=input,
+                        output_streaming=output,
+                    )
+                )
+
+            remote_config_dict["inference_methods"].append((task_class, task_methods))
+
+        # parse train method signature if there is one
+        if module_class.TRAIN_SIGNATURE and (
+            module_class.TRAIN_SIGNATURE.return_type is not None
+            and module_class.TRAIN_SIGNATURE.parameters is not None
+        ):
+
+            rpc_name = ModuleClassTrainRPC.module_class_to_rpc_name(module_class)
+            request_dm = get_train_request(module_class)
+
+            remote_config_dict["train_method"] = RemoteMethodRpc(
+                signature=module_class.TRAIN_SIGNATURE,
+                request_dm=request_dm,
+                response_dm=module_class.TRAIN_SIGNATURE.return_type,
+                rpc_name=rpc_name,
+            )
+
+        return RemoteModuleConfig(remote_config_dict)
