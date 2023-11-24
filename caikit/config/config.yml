@@ -150,6 +150,10 @@ runtime:
 
     # Configuration items for service generation
     service_generation:
+        # Defines the name of the runtime service package
+        package: null
+        domain: null
+
         # Toggles for the generated inference and training services
         enable_inference: true
         enable_training: true
