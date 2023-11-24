@@ -43,6 +43,7 @@ import aconfig
 import alog
 
 # Local
+from ...config import get_config
 from ..exceptions import error_handler
 from ..modules import ModuleConfig
 from ..registries import module_registry
@@ -148,8 +149,10 @@ class RemoteModelFinder(ModelFinderBase):
                 f"Model {model_path} is not supported by finder {self._instance_name}"
             )
 
+        # Get reference to module_class object
         module_class = self._supported_models.get(model_path, self._default_module)
 
+        # Construct model config dict
         remote_config_dict = {
             # Connection info
             "connection": self._connection_info,
@@ -169,12 +172,12 @@ class RemoteModelFinder(ModelFinderBase):
             for input, output, signature in module_class.get_inference_signatures(
                 task_class
             ):
+                # Generate the rpc name
+                rpc_name = f"/{self._get_service_name(training=False)}/{task_class.__name__}Predict"
 
-                rpc_name = f"{task_class.__name__}Predict"
-
-                # This code is completely stolen from caikit.runtime.service_factory.get_inference_request
                 # Don't get the actual DataBaseObject as the ServicePackage might not have
                 # been generated
+                # ! Warning This code is stolen from caikit.runtime.service_factory.get_inference_request
                 if input and output:
                     request_class_name = f"BidiStreaming{task_class.__name__}Request"
                 elif input:
@@ -204,7 +207,7 @@ class RemoteModelFinder(ModelFinderBase):
         ):
             # This code is completely stolen from caikit.runtime.service_generation.rpc.ModuleClassTrainRPC
             first_task = next(iter(module_class.tasks))
-            rpc_name = f"{first_task.__name__}{module_class.__name__}Train"
+            rpc_name = f"/{self._get_service_name(training=True)}/{first_task.__name__}{module_class.__name__}Train"
             request_dm_name = f"{rpc_name}Request"
 
             remote_config_dict["train_method"] = RemoteMethodRpc(
@@ -215,3 +218,27 @@ class RemoteModelFinder(ModelFinderBase):
             )
 
         return RemoteModuleConfig(remote_config_dict)
+
+    def _get_service_name(self, training: bool = False):
+        """Helper function to compute the ServicePackage name"""
+        # ! Warning This code is copied from caikit.runtime.service_generation.proto_package.get_ai_domain
+        lib = get_config().runtime.library
+        default_ai_domain_name = lib.replace("caikit_", "")
+        default_ai_domain_upper_camel = "".join(
+            [part[0].upper() + part[1:] for part in default_ai_domain_name.split("_")]
+        )
+        service_domain_name = (
+            get_config().runtime.service_generation.domain
+            or default_ai_domain_upper_camel
+        )
+
+        # ! Warning This code is copied from caikit.runtime.service_generation.proto_package.get_runtime_service_package
+        service_package_name = (
+            get_config().runtime.service_generation.package
+            or f"caikit.runtime.{service_domain_name}"
+        )
+
+        if training:
+            return f"{service_package_name}.{service_domain_name}TrainingService"
+        else:
+            return f"{service_package_name}.{service_domain_name}Service"

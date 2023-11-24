@@ -23,12 +23,8 @@ model_management:
             type: REMOTE
 """
 # Standard
-from contextlib import contextmanager
-from functools import cached_property, partial
 from inspect import signature
 from typing import Any, Dict, List, Optional, Tuple
-import copy
-import inspect
 import uuid
 
 # Third Party
@@ -39,23 +35,15 @@ import aconfig
 import alog
 
 # Local
-from ..data_model import DataBase, DataObjectBase
+from ...config import get_config
+from ..data_model import DataBase
 from ..exceptions import error_handler
-from ..module_backends import BackendBase, backend_types
-from ..modules import ModuleBase, ModuleConfig, module
-from ..modules.decorator import SUPPORTED_LOAD_BACKENDS_VAR_NAME
-from ..modules.meta import _ModuleBaseMeta
-from ..registries import (
-    module_backend_classes,
-    module_backend_registry,
-    module_backend_types,
-)
-from ..signature_parsing import CaikitMethodSignature
+from ..modules import ModuleBase, module
 from ..task import TaskBase
 from .model_initializer_base import ModelInitializerBase
 from .remote_model_finder import RemoteMethodRpc, RemoteModuleConfig
 
-log = alog.use_channel("RLOAD")
+log = alog.use_channel("RINIT")
 error = error_handler.get(log)
 
 
@@ -77,24 +65,20 @@ class RemoteModelInitializer(ModelInitializerBase):
             "<COR47750753E>", RemoteModuleConfig, model_config=model_config
         )
 
+        # Construct remote module class if one has not already been created
         if model_config.module_id not in self._module_class_map:
-            self._module_class_map[model_config.module_id] = self._init_module_class(
-                model_config
+            self._module_class_map[
+                model_config.module_id
+            ] = construct_remote_module_class(
+                model_config.inference_methods,
+                model_config.train_method,
+                model_config.module_id,
+                model_config.model_name,
             )
 
         remote_module_class = self._module_class_map[model_config.module_id]
         return remote_module_class(
             model_config.connection, model_config.protocol, model_config.model_path
-        )
-
-    def _init_module_class(self, model_config: RemoteModuleConfig) -> type[ModuleBase]:
-        """Helper class to create Module"""
-
-        return construct_remote_module_class(
-            model_config.inference_methods,
-            model_config.train_method,
-            model_config.module_id,
-            model_config.model_name,
         )
 
 
@@ -104,14 +88,17 @@ def construct_remote_module_class(
     source_module_id: str = None,
     source_module_name: str = None,
 ) -> type[ModuleBase]:
-    # Don't default to uuid.uuid4 in args to ensure value is recomputed.
+    """Helper function to construct unique Remote Module Class."""
+
+    # Construct new module id and name
     remote_module_id = (
-        f"{source_module_id}_remote" if source_module_id else uuid.uuid4()
+        f"{source_module_id}_remote" if source_module_id else f"{uuid.uuid4()}_remote"
     )
     remote_module_name = (
         f"{source_module_name} Remote" if source_module_name else "Remote Module"
     )
 
+    # Construct unique class which will have functions attached to it
     class _RemoteModelInstance(_RemoteModelBaseClass):
         pass
 
@@ -135,6 +122,7 @@ def construct_remote_module_class(
                 _RemoteModelInstance, infer_method.signature.method_name, infer_func
             )
 
+    # Wrap Module with decorator to ensure attributes are properly set
     _RemoteModelInstance = module(
         id=remote_module_id,
         name=remote_module_name,
@@ -148,22 +136,24 @@ def construct_remote_module_class(
 
 
 class _RemoteModelBaseClass(ModuleBase):
-    """Private class to act as the base for remote modules. This class will be subclassed and mutated by the
-    RemoteModelInitializer to make it have the same functions and parameters as the source module."""
+    """Private class to act as the base for remote modules. This class will be subclassed and mutated by
+    construct_remote_module_class to make it have the same functions and parameters as the source module."""
 
     def __init__(self, connection_info: Dict[str, Any], protocol: str, model_name: str):
         self.connection_info = connection_info
         self.protocol = protocol
         self.model_name = model_name
 
+    ### Method Generation Helpers
+
     @classmethod
     def generate_train_function(cls, method: RemoteMethodRpc):
-        """Helper function to generate a train function that will then be set as an attribute"""
+        """Helper function to construct a train function that will then be set as an attribute"""
 
         def train_func(self, *args, **kwargs) -> method.signature.return_type:
-            return self.remote_train(*args, method=method, **kwargs)
+            return self.remote_method_request(*args, method=method, **kwargs)
 
-        # Override infer function name attributes
+        # Override infer function name attributes and signature
         train_func.__name__ = method.signature.method_name
         train_func.__qualname__ = method.signature._method_pointer.__qualname__
         train_func.__signature__ = signature(method.signature._method_pointer)
@@ -171,73 +161,46 @@ class _RemoteModelBaseClass(ModuleBase):
 
     @classmethod
     def generate_inference_function(cls, task: type[TaskBase], method: RemoteMethodRpc):
-        """Helper function to generate inference functions that will be set as attributes"""
+        """Helper function to construct inference functions that will be set as an attribute."""
 
         def infer_func(self, *args, **kwargs) -> method.signature.return_type:
-            return self.remote_infer(
+            return self.remote_method_request(
                 *args,
                 method=method,
                 **kwargs,
             )
 
-        # Override infer function name attributes
+        # Override infer function name attributes and signature
         infer_func.__name__ = method.signature.method_name
         infer_func.__qualname__ = method.signature._method_pointer.__qualname__
         infer_func.__signature__ = signature(method.signature._method_pointer)
 
+        # Wrap infer function with task method to ensure internal attributes are properly
+        # set
         task_wrapped_infer_func = task.taskmethod(
             method.input_streaming, method.output_streaming
         )(infer_func)
         return task_wrapped_infer_func
 
-    # Cache the service-package to avoid computation. Don't do this in init as
-    # it has to be called after the runtime server has started
-    @cached_property
-    def inference_service_package(self):
-        # Local
-        from ...runtime.service_factory import ServicePackageFactory
+    ### Remote Interface
 
-        return ServicePackageFactory.get_service_package(
-            ServicePackageFactory.ServiceType.INFERENCE
-        )
-
-    @cached_property
-    def training_service_package(self):
-        # Local
-        from ...runtime.service_factory import ServicePackageFactory
-
-        return ServicePackageFactory.get_service_package(
-            ServicePackageFactory.ServiceType.TRAINING
-        )
-
-    def remote_train(self, method: RemoteMethodRpc, *args, **kwargs):
+    def remote_method_request(self, method: RemoteMethodRpc, *args, **kwargs) -> Any:
+        """Function to run a remote request based on the data stored in RemoteMethodRpc"""
         if self.protocol == "grpc":
-            self._request_via_grpc(
-                self.training_service_package, method, *args, **kwargs
-            )
+            return self._request_via_grpc(method, *args, **kwargs)
 
         raise NotImplementedError(f"Unknown protocol {self.protocol}")
 
-    def remote_infer(
-        self,
-        method: RemoteMethodRpc,
-        *args,
-        **kwargs,
-    ):
-        if self.protocol == "grpc":
-            return self._request_via_grpc(
-                self.inference_service_package, method, *args, **kwargs
-            )
-
-        raise NotImplementedError(f"Unknown protocol {self.protocol}")
+    ### GRPC Helper Functions
 
     def _request_via_grpc(
         self,
-        service_package: "ServicePackage",
         method: RemoteMethodRpc,
         *args,
         **kwargs,
-    ):
+    ) -> Any:
+        """Helper function to send a grpc request"""
+
         channel_target = self._get_channel_target()
         grpc_options = self._get_grpc_options()
         with Channel(channel_target, grpc_options, None, None) as channel:
@@ -245,22 +208,51 @@ class _RemoteModelBaseClass(ModuleBase):
             request_dm = DataBase.get_class_for_name(method.request_dm_name)(
                 *args, **kwargs
             )
+            request_protobuf_message = request_dm.to_proto()
+
+            # Construct the response types
+            response_dm_class = DataBase.get_class_for_name(method.response_dm_name)
+            response_protobuf_class = response_dm_class.get_proto_class()
+
+            # Construct the service_rpc and serializers
+            if method.input_streaming and method.output_streaming:
+                service_rpc = channel.stream_stream(
+                    method.rpc_name,
+                    request_serializer=request_protobuf_message.SerializeToString,
+                    response_deserializer=response_protobuf_class.FromString,
+                )
+            elif method.input_streaming:
+                service_rpc = channel.stream_unary(
+                    method.rpc_name,
+                    request_serializer=request_protobuf_message.SerializeToString,
+                    response_deserializer=response_protobuf_class.FromString,
+                )
+            elif method.output_streaming:
+                service_rpc = channel.unary_stream(
+                    method.rpc_name,
+                    request_serializer=request_protobuf_message.SerializeToString,
+                    response_deserializer=response_protobuf_class.FromString,
+                )
+            else:
+                service_rpc = channel.unary_unary(
+                    method.rpc_name,
+                    request_serializer=request_protobuf_message.SerializeToString,
+                    response_deserializer=response_protobuf_class.FromString,
+                )
 
             # Send RPC request and close channel once completed
-            stub = service_package.stub_class(channel)
-            rpc = getattr(stub, method.rpc_name)
-            response_protobuf = rpc(
-                request_dm.to_proto(), metadata=[("mm-model-id", self.model_name)]
+            response_protobuf = service_rpc(
+                request_protobuf_message, metadata=[("mm-model-id", self.model_name)]
             )
 
-            return DataBase.get_class_for_name(method.response_dm_name).from_proto(
-                response_protobuf
-            )
+            return response_dm_class.from_proto(response_protobuf)
 
     def _get_grpc_options(self) -> List[Tuple]:
+        """Helper function to get list of grpc options"""
         return list(self.connection_info.get("options", {}).items())
 
     def _get_channel_target(self) -> str:
+        """Get the current cha"""
         host = self.connection_info.get("host")
         port = self.connection_info.get("port")
         return f"{host}:{port}"
