@@ -23,19 +23,20 @@ model_management:
             type: REMOTE
 """
 # Standard
+from contextlib import contextmanager
 from inspect import signature
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 # Third Party
-from grpc._channel import Channel
+import grpc
 
 # First Party
 import aconfig
 import alog
 
 # Local
-from ...config import get_config
 from ..data_model import DataBase
 from ..exceptions import error_handler
 from ..modules import ModuleBase, module
@@ -144,6 +145,27 @@ class _RemoteModelBaseClass(ModuleBase):
         self.protocol = protocol
         self.model_name = model_name
 
+        # Load TLS files on startup to stop unneeded reads
+        self.tls_enabled = self.connection_info.get("tls", {}).get("enabled", False)
+        if self.tls_enabled:
+            self.ca_data = None
+            if ca_file_name := self.connection_info.get("tls", {}).get("ca"):
+                ca_file = Path(ca_file_name)
+                if not ca_file.exists():
+                    raise FileNotFoundError(
+                        f"Unable to find TLS CA file at {ca_file_name}"
+                    )
+                self.ca_data = ca_file.read_bytes()
+
+            self.mtls_cert_data = None
+            if mtls_cert_file_name := self.connection_info.get("tls", {}).get("cert"):
+                mtls_cert_file = Path(mtls_cert_file_name)
+                if not mtls_cert_file.exists():
+                    raise FileNotFoundError(
+                        f"Unable to find TLS CA file at {mtls_cert_file_name}"
+                    )
+                self.mtls_cert_data = mtls_cert_file.read_bytes()
+
     ### Method Generation Helpers
 
     @classmethod
@@ -191,6 +213,15 @@ class _RemoteModelBaseClass(ModuleBase):
 
         raise NotImplementedError(f"Unknown protocol {self.protocol}")
 
+    ### HTTP Helper Functions
+    def _request_via_http(
+        self,
+        method: RemoteMethodRpc,
+        *args,
+        **kwargs,
+    ) -> Any:
+        pass
+
     ### GRPC Helper Functions
 
     def _request_via_grpc(
@@ -201,9 +232,7 @@ class _RemoteModelBaseClass(ModuleBase):
     ) -> Any:
         """Helper function to send a grpc request"""
 
-        channel_target = self._get_channel_target()
-        grpc_options = self._get_grpc_options()
-        with Channel(channel_target, grpc_options, None, None) as channel:
+        with self._construct_grpc_channel() as channel:
             # Construct the request object
             request_dm = DataBase.get_class_for_name(method.request_dm_name)(
                 *args, **kwargs
@@ -247,12 +276,39 @@ class _RemoteModelBaseClass(ModuleBase):
 
             return response_dm_class.from_proto(response_protobuf)
 
-    def _get_grpc_options(self) -> List[Tuple]:
-        """Helper function to get list of grpc options"""
-        return list(self.connection_info.get("options", {}).items())
+    @contextmanager
+    def _construct_grpc_channel(self) -> grpc.Channel:
+        # Gather grpc configuration
+        target = self._get_remote_target()
+        options = list(self.connection_info.get("options", {}).items())
 
-    def _get_channel_target(self) -> str:
+        # Generate channel
+        if self.tls_enabled:
+            grpc_credentials = grpc.ssl_channel_credentials(
+                root_certificates=self.ca_data, private_key=self.mtls_cert_data
+            )
+            channel = grpc.secure_channel(
+                target, credentials=grpc_credentials, options=options
+            )
+        else:
+            channel = grpc.insecure_channel(target, options=options)
+
+        yield channel
+
+        # Ensure channel is closed after request
+        channel.close()
+
+    ### Generic Helper Functions
+
+    def _get_remote_target(self) -> str:
         """Get the current cha"""
         host = self.connection_info.get("host")
         port = self.connection_info.get("port")
-        return f"{host}:{port}"
+        target_string = f"{host}:{port}"
+        if self.protocol == "grpc":
+            return target_string
+        else:
+            if self.tls_enabled:
+                return f"http://{target_string}"
+            else:
+                return f"https://{target_string}"

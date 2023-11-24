@@ -25,8 +25,9 @@ model_management:
                     host: str <remote host>
                     port: int <remote port>
                     tls:
-                        ca: Optional[str] <path to remote ca file>
-                        cert: Optional[str] <path to MTLS cert>
+                        enabled: Optional[bool]=false <if ssl is enabled on the remote server>
+                        ca: Optional[str] <path to custom remote ca file>
+                        cert: Optional[str] <path to MTLS client cert>
                     options: Optional[Dict[str,str]] <optional dict of grpc or rest options>
                 protocol: Optional[str]="grpc" <protocol the remote server is using>
                 default_module: Optional[str] <the default module_class to use if one is not provided>
@@ -125,7 +126,9 @@ class RemoteModelFinder(ModelFinderBase):
         error.type_check(
             "<COR74321567E>",
             str,
+            bool,
             allow_none=True,
+            tls_enabled=tls_info.get("enabled"),
             tls_ca=tls_info.get("ca"),
             tls_cert=tls_info.get("cert"),
         )
@@ -238,6 +241,7 @@ class RemoteModelFinder(ModelFinderBase):
             or f"caikit.runtime.{service_domain_name}"
         )
 
+        # ! Warning This code is largely copied from caikit.runtime.service_factory.get_service_package
         if training:
             return f"{service_package_name}.{service_domain_name}TrainingService"
         else:
