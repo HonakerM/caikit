@@ -90,7 +90,7 @@ class RemoteMethodRpc:
     # Request and response objects for this RPC
     request_dm_name: str
     response_dm_name: str
-    # The function name on the GRPC Servicer
+    # Either the function name of the GRPC Servicer or HTTP endpoint
     rpc_name: str
 
     # Only used for infer RPC types
@@ -176,9 +176,26 @@ class RemoteModelFinder(ModelFinderBase):
             for input, output, signature in module_class.get_inference_signatures(
                 task_class
             ):
-                task_request_name = f"{task_class.__name__}Predict"
+
+                # Don't get the actual DataBaseObject as the ServicePackage might not have
+                # been generated
+                # ! Warning This code is stolen from caikit.runtime.service_factory.get_inference_request
+                # ! Warning This code is stolen from caikit.runtime.rpcs.TaskPredictRPC._task_to_rpc_name
+                if input and output:
+                    request_class_name = f"BidiStreaming{task_class.__name__}Request"
+                    task_request_name = f"BidiStreaming{task_class.__name__}Predict"
+                elif input:
+                    request_class_name = f"ClientStreaming{task_class.__name__}Request"
+                    task_request_name = f"ClientStreaming{task_class.__name__}Predict"
+                elif output:
+                    request_class_name = f"ServerStreaming{task_class.__name__}Request"
+                    task_request_name = f"ServerStreaming{task_class.__name__}Predict"
+                else:
+                    request_class_name = f"{task_class.__name__}Request"
+                    task_request_name = f"{task_class.__name__}Predict"
 
                 # Generate the rpc name and task type
+                # ! Warning this code is inferred from RuntimeGrpcServer and RuntimeHttpServer
                 if self._protocol == "grpc":
                     rpc_name = (
                         f"/{self._get_service_name(training=False)}/{task_request_name}"
@@ -187,18 +204,6 @@ class RemoteModelFinder(ModelFinderBase):
                     rpc_name = (
                         f"/api/v1/task/{self._get_http_rpc_name(task_request_name)}"
                     )
-
-                # Don't get the actual DataBaseObject as the ServicePackage might not have
-                # been generated
-                # ! Warning This code is stolen from caikit.runtime.service_factory.get_inference_request
-                if input and output:
-                    request_class_name = f"BidiStreaming{task_class.__name__}Request"
-                elif input:
-                    request_class_name = f"ClientStreaming{task_class.__name__}Request"
-                elif output:
-                    request_class_name = f"ServerStreaming{task_class.__name__}Request"
-                else:
-                    request_class_name = f"{task_class.__name__}Request"
 
                 task_methods.append(
                     RemoteMethodRpc(
@@ -218,10 +223,11 @@ class RemoteModelFinder(ModelFinderBase):
             module_class.TRAIN_SIGNATURE.return_type is not None
             and module_class.TRAIN_SIGNATURE.parameters is not None
         ):
-            # ! Warning this code is stolen from caikit.runtime.service_generation.rpc.ModuleClassTrainRPC
+            # ! Warning this code is stolen from caikit.runtime.service_generation.rpc.ModuleClassTrainRPC.module_class_to_rpc_name
             first_task = next(iter(module_class.tasks))
             train_request_name = f"{first_task.__name__}{module_class.__name__}Train"
 
+            # ! Warning this code is inferred from RuntimeGrpcServer and RuntimeHttpServer
             if self._protocol == "grpc":
                 rpc_name = (
                     f"/{self._get_service_name(training=True)}/{train_request_name}"
@@ -229,6 +235,7 @@ class RemoteModelFinder(ModelFinderBase):
             else:
                 rpc_name = f"/api/v1/task/{self._get_http_rpc_name(train_request_name)}"
 
+            # ! Warning this code is taken from caikit.runtime.service_generation.rpcs.ModuleClassTrainRPC.module_class_to_req_name
             request_dm_name = f"{train_request_name}Request"
 
             remote_config_dict["train_method"] = RemoteMethodRpc(

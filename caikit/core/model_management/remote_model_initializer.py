@@ -338,7 +338,7 @@ class _RemoteModelBaseClass(ModuleBase):
         target = self._get_remote_target()
         options = list(self.connection_info.get("options", {}).items())
 
-        # Generate channel
+        # Generate schannel
         if self.tls_enabled:
             grpc_credentials = grpc.ssl_channel_credentials(
                 root_certificates=self.ca_data, private_key=self.mtls_cert_data
@@ -357,7 +357,7 @@ class _RemoteModelBaseClass(ModuleBase):
     ### Generic Helper Functions
 
     def _get_remote_target(self) -> str:
-        """Get the current cha"""
+        """Get the current remote target"""
         host = self.connection_info.get("host")
         port = self.connection_info.get("port")
         target_string = f"{host}:{port}"
