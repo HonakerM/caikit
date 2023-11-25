@@ -38,6 +38,7 @@ model_management:
 # Standard
 from dataclasses import dataclass
 from typing import Optional
+import re
 
 # First Party
 import aconfig
@@ -175,8 +176,17 @@ class RemoteModelFinder(ModelFinderBase):
             for input, output, signature in module_class.get_inference_signatures(
                 task_class
             ):
-                # Generate the rpc name
-                rpc_name = f"/{self._get_service_name(training=False)}/{task_class.__name__}Predict"
+                task_request_name = f"{task_class.__name__}Predict"
+
+                # Generate the rpc name and task type
+                if self._protocol == "grpc":
+                    rpc_name = (
+                        f"/{self._get_service_name(training=False)}/{task_request_name}"
+                    )
+                else:
+                    rpc_name = (
+                        f"/api/v1/task/{self._get_http_rpc_name(task_request_name)}"
+                    )
 
                 # Don't get the actual DataBaseObject as the ServicePackage might not have
                 # been generated
@@ -208,10 +218,18 @@ class RemoteModelFinder(ModelFinderBase):
             module_class.TRAIN_SIGNATURE.return_type is not None
             and module_class.TRAIN_SIGNATURE.parameters is not None
         ):
-            # This code is completely stolen from caikit.runtime.service_generation.rpc.ModuleClassTrainRPC
+            # ! Warning this code is stolen from caikit.runtime.service_generation.rpc.ModuleClassTrainRPC
             first_task = next(iter(module_class.tasks))
-            rpc_name = f"/{self._get_service_name(training=True)}/{first_task.__name__}{module_class.__name__}Train"
-            request_dm_name = f"{rpc_name}Request"
+            train_request_name = f"{first_task.__name__}{module_class.__name__}Train"
+
+            if self._protocol == "grpc":
+                rpc_name = (
+                    f"/{self._get_service_name(training=True)}/{train_request_name}"
+                )
+            else:
+                rpc_name = f"/api/v1/task/{self._get_http_rpc_name(train_request_name)}"
+
+            request_dm_name = f"{train_request_name}Request"
 
             remote_config_dict["train_method"] = RemoteMethodRpc(
                 signature=module_class.TRAIN_SIGNATURE,
@@ -246,3 +264,15 @@ class RemoteModelFinder(ModelFinderBase):
             return f"{service_package_name}.{service_domain_name}TrainingService"
         else:
             return f"{service_package_name}.{service_domain_name}Service"
+
+    def _get_http_rpc_name(self, rpc_name: str) -> str:
+        # ! Warning this code is stolen from caikit.runtime.http_server.http_server._get_route
+        if rpc_name.endswith("Predict"):
+            return re.sub(
+                r"(?<!^)(?=[A-Z])",
+                "-",
+                re.sub("Task$", "", re.sub("Predict$", "", rpc_name)),
+            ).lower()
+        elif rpc_name.endswith("Train"):
+            return rpc_name.lower()
+        raise ValueError(f"Unknown rpc type with name {rpc_name}")

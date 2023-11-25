@@ -27,10 +27,12 @@ from contextlib import contextmanager
 from inspect import signature
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import json
 import uuid
 
 # Third Party
 import grpc
+import requests
 
 # First Party
 import aconfig
@@ -39,6 +41,7 @@ import alog
 # Local
 from ..data_model import DataBase
 from ..exceptions import error_handler
+from ..exceptions.caikit_core_exception import CaikitCoreException, CaikitCoreStatusCode
 from ..modules import ModuleBase, module
 from ..task import TaskBase
 from .model_initializer_base import ModelInitializerBase
@@ -148,21 +151,25 @@ class _RemoteModelBaseClass(ModuleBase):
         # Load TLS files on startup to stop unneeded reads
         self.tls_enabled = self.connection_info.get("tls", {}).get("enabled", False)
         if self.tls_enabled:
+            # Gather CA file
             self.ca_data = None
-            if ca_file_name := self.connection_info.get("tls", {}).get("ca"):
-                ca_file = Path(ca_file_name)
+            self.ca_file_name = self.connection_info.get("tls", {}).get("ca")
+            if self.ca_file_name:
+                ca_file = Path(self.ca_file_name)
                 if not ca_file.exists():
                     raise FileNotFoundError(
-                        f"Unable to find TLS CA file at {ca_file_name}"
+                        f"Unable to find TLS CA file at {self.ca_file_name}"
                     )
                 self.ca_data = ca_file.read_bytes()
 
+            # Gather MTLS Cert
             self.mtls_cert_data = None
-            if mtls_cert_file_name := self.connection_info.get("tls", {}).get("cert"):
-                mtls_cert_file = Path(mtls_cert_file_name)
+            self.mtls_cert_file_name = self.connection_info.get("tls", {}).get("cert")
+            if self.mtls_cert_file_name:
+                mtls_cert_file = Path(self.mtls_cert_file_name)
                 if not mtls_cert_file.exists():
                     raise FileNotFoundError(
-                        f"Unable to find TLS CA file at {mtls_cert_file_name}"
+                        f"Unable to find TLS CA file at {self.mtls_cert_file_name}"
                     )
                 self.mtls_cert_data = mtls_cert_file.read_bytes()
 
@@ -177,8 +184,8 @@ class _RemoteModelBaseClass(ModuleBase):
 
         # Override infer function name attributes and signature
         train_func.__name__ = method.signature.method_name
-        train_func.__qualname__ = method.signature._method_pointer.__qualname__
-        train_func.__signature__ = signature(method.signature._method_pointer)
+        train_func.__qualname__ = method.signature.qualified_name
+        train_func.__signature__ = method.signature.method_signature
         return train_func
 
     @classmethod
@@ -194,8 +201,8 @@ class _RemoteModelBaseClass(ModuleBase):
 
         # Override infer function name attributes and signature
         infer_func.__name__ = method.signature.method_name
-        infer_func.__qualname__ = method.signature._method_pointer.__qualname__
-        infer_func.__signature__ = signature(method.signature._method_pointer)
+        infer_func.__qualname__ = method.signature.qualified_name
+        infer_func.__signature__ = method.signature.method_signature
 
         # Wrap infer function with task method to ensure internal attributes are properly
         # set
@@ -210,6 +217,8 @@ class _RemoteModelBaseClass(ModuleBase):
         """Function to run a remote request based on the data stored in RemoteMethodRpc"""
         if self.protocol == "grpc":
             return self._request_via_grpc(method, *args, **kwargs)
+        elif self.protocol == "http":
+            return self._request_via_http(method, *args, **kwargs)
 
         raise NotImplementedError(f"Unknown protocol {self.protocol}")
 
@@ -220,7 +229,54 @@ class _RemoteModelBaseClass(ModuleBase):
         *args,
         **kwargs,
     ) -> Any:
-        pass
+        # Get request data model
+        request_dm = DataBase.get_class_for_name(method.request_dm_name)(
+            *args, **kwargs
+        )
+        # This is a hack to ensure all fields/types are json encodable
+        request_dm_dict = json.loads(request_dm.to_json())
+
+        # Parse generic Request type into HttpRequest format
+        http_request_dict = {
+            "inputs": {},
+            "parameters": {},
+            "model_id": self.model_name,
+        }
+        for param, value in request_dm_dict.items():
+            # If param doesn't have a default then add it to inputs
+            if param not in method.signature.default_parameters:
+                http_request_dict["inputs"][param] = value
+
+            # If the parameter value is different then the default then add it
+            elif value != method.signature.default_parameters.get(param):
+                http_request_dict["parameters"][param] = value
+
+        # If there is only one inputs then collapse down the value
+        if len(http_request_dict["inputs"]) == 1:
+            http_request_dict["inputs"] = list(http_request_dict["inputs"].values())[0]
+
+        # Get request options and target
+        request_kwargs = {"headers": {"Content-type": "application/json"}}
+        if self.tls_enabled:
+            request_kwargs["cert"] = self.mtls_cert_file_name
+            request_kwargs["verify"] = self.ca_file_name or True
+        request_url = f"{self._get_remote_target()}{method.rpc_name}"
+
+        # Send request
+        response = requests.post(
+            request_url, data=json.dumps(http_request_dict), **request_kwargs
+        )
+        if response.status_code != 200:
+            raise CaikitCoreException(
+                CaikitCoreStatusCode.UNKNOWN,
+                f"Receieved status {response.status_code} from remote server",
+            )
+
+        # Parse response data model either as file or json
+        response_dm_class = DataBase.get_class_for_name(method.response_dm_name)
+        if response_dm_class.supports_file_operations:
+            return response_dm_class.from_file(response.text)
+        return response_dm_class.from_json(response.text)
 
     ### GRPC Helper Functions
 
@@ -309,6 +365,6 @@ class _RemoteModelBaseClass(ModuleBase):
             return target_string
         else:
             if self.tls_enabled:
-                return f"http://{target_string}"
-            else:
                 return f"https://{target_string}"
+            else:
+                return f"http://{target_string}"
