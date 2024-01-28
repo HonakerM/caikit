@@ -16,9 +16,8 @@ This file contains interfaces required for unions of lists
 """
 
 # Standard
-from typing import Any, List
 from dataclasses import dataclass
-from typing import List
+from typing import Any, List
 
 # First Party
 from py_to_proto.dataclass_to_proto import Annotated, FieldNumber
